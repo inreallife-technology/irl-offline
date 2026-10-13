@@ -1,0 +1,29 @@
+name: Check
+
+# Reads the pull request's text files and nothing else: read-only token,
+# no secrets, and the check script comes from the base branch, so code in a
+# pull request never runs.
+on: pull_request
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Take the check from the base branch
+        run: git show "origin/$BASE_REF:bin/check" > "$RUNNER_TEMP/check"
+        env:
+          BASE_REF: ${{ github.base_ref }}
+
+      - name: Check the changed files
+        run: ruby "$RUNNER_TEMP/check" --changed-since "origin/$BASE_REF"
+        env:
+          BASE_REF: ${{ github.base_ref }}

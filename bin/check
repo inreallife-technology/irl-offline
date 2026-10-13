@@ -1,0 +1,252 @@
+#!/usr/bin/env ruby
+# frozen_string_literal: true
+
+# Checks the form of the entries in this repo: where each file lives, its
+# fields, its length, no contact details, no duplicates. Whether an entry
+# belongs here is for a person to decide.
+#
+#   bin/check                        every entry
+#   bin/check --changed-since main   the files changed since main, against every entry
+#
+# Standard library only: the GitHub Action runs it with the runner's Ruby.
+
+require "yaml"
+
+module Offline
+  class Check
+    Problem = Struct.new(:path, :message)
+
+    FOLDERS = %w[map manifesto constitution].freeze
+    # The repo's own files: a pull request may change them, Luc reads it
+    REPO_FILES = %r{\A(README\.md|CONTRIBUTING\.md|LICENSE|\.gitignore|\.github/.+|bin/.+|test/.+)\z}
+
+    NAME = /[a-z0-9]+(?:-[a-z0-9]+)*/
+    MAP_PATH = %r{\Amap/([a-z]{2})/(#{NAME})/#{NAME}\.yml\z}
+    MANIFESTO_PATH = %r{\Amanifesto/#{NAME}\.md\z}
+    CONSTITUTION_PATH = %r{\Aconstitution/#{NAME}\.md\z}
+
+    MAP_FIELDS = %w[city country activity category group_size i_would_host description].freeze
+    PRINCIPLE = /\A# ([^\n]+)\n\n\*\*Why:\*\* (.+?)\n\n\*\*In practice:\*\* (.+)\z/m
+    MAX_BYTES = 4_096
+
+    # Dates aren't public listings: the apps keep them behind a checked selfie
+    DATING = /\b(dating|singles|flirt\w*|romance|romantic|hookups?)\b/i
+
+    CONTACTS = {
+      /[^\s@]+@[^\s@]+\.[^\s@]+/ => "an email address",
+      /(?:\+|\b)\d(?:[\s.\-()]*\d){7,}/ => "a phone number",
+      %r{https?://|www\.|\b[a-z0-9-]+\.(?:com|net|org|io|co|app|dev|me|ly|gg|xyz|ai|so|to|eu|fr|de|uk|es|it|nl|be|ch)\b}i => "a link"
+    }.freeze
+
+    # Near-exact: up to one character in ten differs, once case and punctuation are set aside
+    NEAR = 0.1
+
+    def initialize(root, changed: nil)
+      @root = root
+      @changed = changed
+    end
+
+    def problems
+      found = []
+      entries = {}
+
+      entry_paths.each do |path|
+        messages, key = inspect_entry(path)
+        found.concat(messages.map { |message| Problem.new(path, message) }) if in_scope?(path)
+        entries[path] = key if messages.empty?
+      end
+
+      found + stray_files + duplicates(entries)
+    end
+
+    private
+      def entry_paths
+        Dir.glob("{#{FOLDERS.join(",")}}/**/*", File::FNM_DOTMATCH, base: @root).select do |path|
+          full = File.join(@root, path)
+          File.basename(path) != ".DS_Store" && (File.symlink?(full) || File.file?(full))
+        end.sort
+      end
+
+      def in_scope?(path)
+        @changed.nil? || @changed.include?(path)
+      end
+
+      def stray_files
+        Array(@changed).reject { |path| FOLDERS.include?(path.split("/").first) || path.match?(REPO_FILES) }
+          .map { |path| Problem.new(path, wrong_place(path)) }
+      end
+
+      # Returns the messages and, when there are none, what duplicates compare: [group, text]
+      def inspect_entry(path)
+        full = File.join(@root, path)
+        return [ [ "Must be a plain file, not a link." ] ] if File.symlink?(full)
+        return [ [ "Is too big: keep it under #{MAX_BYTES} bytes." ] ] if File.size(full) > MAX_BYTES
+
+        text = File.read(full, encoding: "UTF-8")
+        return [ [ "Must be UTF-8 text." ] ] unless text.valid_encoding?
+
+        case path
+        when MAP_PATH then check_map(text, $1, $2)
+        when MANIFESTO_PATH then check_manifesto(text)
+        when CONSTITUTION_PATH then check_principle(text)
+        else [ [ wrong_place(path) ] ]
+        end
+      end
+
+      def check_map(text, country_folder, city_folder)
+        data = YAML.safe_load(text, aliases: false)
+        return [ [ "Isn't a list of fields like the example in CONTRIBUTING.md." ] ] unless data.is_a?(Hash)
+
+        city, country, activity, category, size, host, description = data.values_at(*MAP_FIELDS)
+        messages = []
+        missing = MAP_FIELDS - data.keys
+        extra = data.keys - MAP_FIELDS
+        messages << "Is missing #{missing.join(", ")}." if missing.any?
+        messages << "Has fields we don't keep: #{extra.join(", ")}. Remove them." if extra.any?
+
+        if !text?(city, 60)
+          messages << "city: a city name, up to 60 characters."
+        elsif !slug(city).empty? && slug(city) != city_folder
+          messages << "city: the folder must be #{slug(city)}/, from the city name."
+        end
+
+        if !country.is_a?(String) || !country.match?(/\A[A-Z]{2}\z/)
+          messages << "country: the two-letter country code, like FR."
+        elsif country.downcase != country_folder
+          messages << "country: the folder must be #{country.downcase}/."
+        end
+
+        messages << "activity: what you'd do, up to 80 characters." unless text?(activity, 80)
+        unless category.is_a?(String) && category.length <= 30 && category.match?(/\A[a-z]+(-[a-z]+)*\z/)
+          messages << "category: one lowercase word, or a few joined by hyphens, like photography."
+        end
+        messages << "group_size: a whole number from 2 to 15, counting the host." unless size.is_a?(Integer) && size.between?(2, 15)
+        messages << "i_would_host: true or false." unless host == true || host == false
+        messages << "description: what it's like, up to 280 characters." unless text?(description, 280)
+
+        texts = [ city, activity, category, description ].grep(String)
+        if texts.any? { |value| value.match?(DATING) }
+          messages << "No dating entries: dates aren't public listings. The README says more."
+        end
+        messages.concat(contact_problems(texts.join("\n")))
+
+        [ messages, [ "map/#{country_folder}/#{city_folder}", normalize(activity.to_s) ] ]
+      rescue Psych::Exception => error
+        [ [ "Isn't valid YAML: #{error.message}" ] ]
+      end
+
+      def check_manifesto(text)
+        line = text.strip
+        messages = []
+        messages << "Is empty." if line.empty?
+        messages << "One statement, on one line." if line.include?("\n")
+        messages << "Is #{line.length} characters: keep it to 140." if line.length > 140
+        messages.concat(contact_problems(line))
+
+        [ messages, [ "manifesto", normalize(line) ] ]
+      end
+
+      def check_principle(text)
+        match = PRINCIPLE.match(text.strip)
+        unless match
+          return [ [ "Needs three parts: a # heading with the principle, then a **Why:** and an **In practice:** paragraph, like the example in CONTRIBUTING.md." ] ]
+        end
+
+        parts = match.captures.map(&:strip)
+        length = parts.sum(&:length)
+        messages = []
+        messages << "Is #{length} characters: keep the three parts to 600 in all." if length > 600
+        messages.concat(contact_problems(parts.join("\n")))
+
+        [ messages, [ "constitution", normalize(parts.first) ] ]
+      end
+
+      # The first one found: an email address is also a link
+      def contact_problems(text)
+        _, what = CONTACTS.find { |pattern, _| text.match?(pattern) }
+        what ? [ "Has #{what}. Entries stay free of contact details and links." ] : []
+      end
+
+      # Each entry is compared with the ones before it, or with every entry
+      # outside the pull request, so a pair is reported once, on the new file
+      def duplicates(entries)
+        entries.filter_map do |path, (group, text)|
+          next unless in_scope?(path)
+
+          twin, _ = entries.find do |other, (other_group, other_text)|
+            other != path && (other < path || !in_scope?(other)) && other_group == group && similar?(text, other_text)
+          end
+          Problem.new(path, "Is the same as #{twin}. Add something new, or improve that one.") if twin
+        end
+      end
+
+      def similar?(a, b)
+        a == b || distance(a, b) <= [ a.length, b.length ].max * NEAR
+      end
+
+      # Levenshtein distance, one row at a time
+      def distance(a, b)
+        row = (0..b.length).to_a
+        a.each_char.with_index(1) do |char_a, i|
+          diagonal, row[0] = row[0], i
+          b.each_char.with_index(1) do |char_b, j|
+            diagonal, row[j] = row[j], [ row[j] + 1, row[j - 1] + 1, diagonal + (char_a == char_b ? 0 : 1) ].min
+          end
+        end
+        row.last
+      end
+
+      def text?(value, max)
+        value.is_a?(String) && !value.strip.empty? && value.strip.length <= max
+      end
+
+      def normalize(text)
+        text.unicode_normalize(:nfkd).downcase.gsub(/\p{Mn}/, "").gsub(/[^a-z0-9]+/, " ").strip
+      end
+
+      def slug(text)
+        normalize(text).tr(" ", "-")
+      end
+
+      def wrong_place(path)
+        case path.split("/").first
+        when "map" then "Map entries go in map/<country>/<city>/<name>.yml, lowercase with hyphens, like map/fr/paris/sunday-photography-walk.yml."
+        when "manifesto" then "Manifesto lines go in manifesto/<name>.md, lowercase with hyphens."
+        when "constitution" then "Principles go in constitution/<name>.md, lowercase with hyphens."
+        else "Entries go in map/, manifesto/ or constitution/."
+        end
+      end
+  end
+end
+
+if $PROGRAM_NAME == __FILE__
+  changed = nil
+  if (index = ARGV.index("--changed-since"))
+    base = ARGV.fetch(index + 1)
+    changed = IO.popen([ "git", "diff", "-z", "--name-only", "--diff-filter=ACMRT", "#{base}...HEAD" ], &:read).split("\0")
+    abort "bin/check: git diff against #{base} failed" unless $?.success?
+  end
+
+  problems = Offline::Check.new(Dir.pwd, changed: changed).problems
+  if problems.empty?
+    puts "All good. A person reads it next."
+    exit
+  end
+
+  problems.each { |problem| puts "#{problem.path}: #{problem.message}" }
+
+  if ENV["GITHUB_ACTIONS"]
+    escape = ->(text) { text.gsub("%", "%25").gsub("\r", "%0D").gsub("\n", "%0A") }
+    problems.each do |problem|
+      puts "::error file=#{escape.(problem.path).gsub(":", "%3A").gsub(",", "%2C")}::#{escape.(problem.message)}"
+    end
+
+    if ENV["GITHUB_STEP_SUMMARY"]
+      summary = [ "### What to fix", "", *problems.map { |problem| "- `#{problem.path}`: #{problem.message}" },
+                  "", "Push the fix to the same branch and the check runs again." ]
+      File.write(ENV["GITHUB_STEP_SUMMARY"], summary.join("\n") + "\n", mode: "a")
+    end
+  end
+
+  exit 1
+end
