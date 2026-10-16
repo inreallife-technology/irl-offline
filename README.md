@@ -33,4 +33,4 @@ Pull requests only: issues and discussions are off, so there's one thing to read
 
 ---
 
-**Merged? Join the beta at [inreallife.technology/join](https://inreallife.technology/join) with your PR link.**
+**Merged? Thank you. Find something near you at [inreallife.technology](https://inreallife.technology).**
