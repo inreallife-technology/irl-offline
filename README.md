@@ -13,7 +13,7 @@ How to write each one: [CONTRIBUTING.md](CONTRIBUTING.md).
 ## What happens to your pull request
 
 1. A check reads your files and says what to fix: folder, fields, length, no contact details, no duplicates.
-2. Luc reads every pull request that passes, and merges or closes it with a sentence on why.
+2. We read every pull request that passes, and merge or close it with a sentence on why.
 
 A map entry is an idea, not an event. Nothing here is published in the apps. If you wrote `i_would_host: true` in a city we open, we'll write to you.
 
